@@ -1,0 +1,107 @@
+{
+  "mcStatus": {
+    "channelId": "1537022017063092234",
+    "messageId": "1537286697715507251",
+    "ip": "nethrionsmp.pixelforge.gg"
+  },
+  "anonCount": 3,
+  "streaks": {
+    "1496731949513834656": {
+      "currentStreak": 4,
+      "highestStreak": 4,
+      "lastActiveDate": "2026-08-13",
+      "totalActiveDays": 4,
+      "count": 1,
+      "lastDate": "2026-08-12"
+    },
+    "1536534262755627059": {
+      "currentStreak": 2,
+      "highestStreak": 2,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 2
+    },
+    "1473827316852461691": {
+      "currentStreak": 2,
+      "highestStreak": 2,
+      "lastActiveDate": "2026-08-13",
+      "totalActiveDays": 2
+    },
+    "1478781091023421581": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "1530573369332727818": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "1354716937741140072": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "1493492431558017172": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "1356274279666421760": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "1487312178103976019": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "959140886569181264": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "1479862110942138439": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "1380881842692947968": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "1422834178386432093": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-12",
+      "totalActiveDays": 1
+    },
+    "1528607234936934440": {
+      "currentStreak": 1,
+      "highestStreak": 1,
+      "lastActiveDate": "2026-08-13",
+      "totalActiveDays": 1
+    }
+  },
+  "ytConfig": {
+    "channelId": "1532668995470229580",
+    "ytChannelId": "UCuAxRsd-5yiQRvPMvWnvMAw",
+    "lastVideoId": "bVY7-h74414"
+  },
+  "ticketConfig": {
+    "channelId": null
+  },
+  "voiceConfig": {
+    "creatorChannelId": null
+  }
+}
