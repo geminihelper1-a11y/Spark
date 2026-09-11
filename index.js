@@ -16,7 +16,6 @@ const {
   Events 
 } = require('discord.js');
 const fs = require('fs');
-const mcs = require('minecraft-server-util');
 require('dotenv').config();
 
 const client = new Client({
@@ -34,11 +33,15 @@ const DATA_FILE = './data.json';
 const tempVCs = new Set();
 const userSelectedChannels = new Map();
 
-// Nethrion SMP — fixed server details for the owner-only live panel (`sp smp-panel`).
-const NETHRION_JAVA_HOST = 'nethrionsmp.pixelforge.gg';
-const NETHRION_JAVA_PORT = 25565;
-const NETHRION_BEDROCK_HOST = '15.235.165.81';
-const NETHRION_BEDROCK_PORT = 26091;
+// NETHRION SMP defaults; `sp smp-set` overrides them per guild.
+const DEFAULT_SMP = {
+  javaHost: 'nethrionsmp.pixelforge.gg',
+  javaPort: 25565,
+  bedrockHost: '15.235.165.81',
+  bedrockPort: 26091
+};
+const REPORT_CHANNEL_NAME = '🚨-【-reports-】';
+const STAFF_ROLE_NAMES = ['owner', 'admin', 'moderator', 'trainee', 'helper'];
 
 function saveData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
@@ -47,7 +50,11 @@ function saveData(data) {
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) {
     const initData = { 
-      mcPanel: { channelId: null, messageId: null }, 
+      mcPanel: { channelId: null, messageId: null },
+      smpConfig: { ...DEFAULT_SMP },
+      reports: [],
+      activity: {},
+      links: {},
       ytConfig: { channelId: null, ytChannelId: null, lastVideoId: null }, 
       streaks: {} 
     };
@@ -57,10 +64,16 @@ function loadData() {
   try {
     const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     if (!parsed.ytConfig) parsed.ytConfig = { channelId: null, ytChannelId: null, lastVideoId: null };
-    if (!parsed.mcPanel) parsed.mcPanel = { channelId: null, messageId: null };
+    if (!parsed.mcPanel) {
+      if (parsed.mcStatus?.channelId && parsed.mcStatus?.messageId) {
+        parsed.mcPanel = { channelId: parsed.mcStatus.channelId, messageId: parsed.mcStatus.messageId };
+      } else {
+        parsed.mcPanel = { channelId: null, messageId: null };
+      }
+    }
     return parsed;
   } catch (e) {
-    return { mcPanel: { channelId: null, messageId: null }, ytConfig: {}, streaks: {} };
+    return { mcPanel: { channelId: null, messageId: null }, smpConfig: { ...DEFAULT_SMP }, ytConfig: {}, streaks: {}, reports: [], activity: {}, links: {} };
   }
 }
 
@@ -86,245 +99,119 @@ const DEFAULT_BEDROCK_PORT = 19132;
 // Simple Java-only status check, used by the public `sp smp` command (works for any
 // server, including ones we have no Bedrock/extra data for). Retries once before
 // declaring offline, so a single dropped packet doesn't produce a false "offline".
-async function fetchJavaStatus(host, port) {
-  let result = null;
-  let online = false;
-
-  for (let attempt = 0; attempt < 2 && !online; attempt++) {
-    try {
-      result = await mcs.status(host, port, { timeout: 7000, enableSRV: true });
-      online = true;
-    } catch (err) {
-      if (attempt === 0) await new Promise(r => setTimeout(r, 1200));
-    }
-  }
-
-  if (!online || !result) {
-    return { isOnline: false, playersOnline: '0/0', version: 'N/A', motd: 'Server is Offline or Starting...' };
-  }
-
-  const playersOnline = (result.players && result.players.online !== undefined)
-    ? `${result.players.online}/${result.players.max}` : '0/0';
-
-  const rawVersion = result.version && result.version.name ? result.version.name : '';
-  let version = cleanMotd(rawVersion) || '1.20+';
-  if (!version || version.toLowerCase().includes('online') || version.length > 25) version = '1.20+';
-
-  let rawMotd = '';
-  if (result.motd) rawMotd = result.motd.clean || result.motd.raw || '';
-  const motd = cleanMotd(rawMotd) || 'A Minecraft Server';
-
-  return { isOnline: true, playersOnline, version, motd };
-}
-
-// Classic minimal embed for `sp smp` — same style everyone is used to.
-function buildSimpleMCEmbed(ip, data) {
-  const embed = new EmbedBuilder().setTimestamp();
-
-  if (data.isOnline) {
-    embed
-      .setTitle('🟢 MINECRAFT SERVER STATUS: ONLINE')
-      .setColor('#2ecc71')
-      .addFields(
-        { name: '🌐 Server IP', value: `\`${ip}\``, inline: true },
-        { name: '👥 Players Online', value: `\`${data.playersOnline}\``, inline: true },
-        { name: '📌 Version', value: `\`${data.version}\``, inline: true },
-        { name: '📝 Description', value: `\`\`\`${data.motd}\`\`\`` }
-      );
-  } else {
-    embed
-      .setTitle('🔴 MINECRAFT SERVER STATUS: OFFLINE')
-      .setColor('#e74c3c')
-      .addFields(
-        { name: '🌐 Server IP', value: `\`${ip}\``, inline: true },
-        { name: '⚠️ Status', value: 'Server is currently offline or restarting.', inline: false }
-      );
-  }
-
-  return embed;
-}
-
-// Full Java + Bedrock status (separate hosts supported), used only by the
-// owner-only live panel (`sp smp-panel`) since that's the only server we
-// have complete Java+Bedrock details for. Bedrock ping is retried too —
-// Bedrock's RakNet ping is UDP-based and drops packets more often than TCP,
-// so a single failed attempt should not be treated as "no Bedrock support".
-// The Server List Ping "sample" field is only a partial, best-effort preview of
-// online players — some server softwares/plugins leave it empty even when
-// players are online. If that happens, fall back to the Query protocol, which
-// returns the real, complete player list — but it only works if the server
-// owner has enabled it (enable-query=true in server.properties).
-async function fetchPlayerListViaQuery(host, port) {
+async function fetchMinecraftStatus(kind, host, port, timeoutSeconds = 5) {
+  const defaultPort = kind === 'java' ? 25565 : 19132;
+  const address = encodeURIComponent(`${host}${port !== defaultPort ? `:${port}` : ''}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(3000, timeoutSeconds * 1000));
   try {
-    const q = await mcs.queryFull(host, port, { timeout: 5000, enableSRV: false });
-    if (q && Array.isArray(q.players)) {
-      return q.players.map(p => cleanMotd(p)).filter(Boolean);
-    }
-  } catch (err) {
-    // Query protocol is disabled or unreachable — not fatal, just no name list.
+    const response = await fetch(`https://api.mcstatus.io/v2/status/${kind}/${address}`, {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'Spark-NETHRION/2.0' }
+    });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(raw || `HTTP ${response.status}`);
+    return JSON.parse(raw);
+  } finally {
+    clearTimeout(timer);
   }
-  return [];
+}
+
+async function fetchJavaStatus(host, port) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await fetchMinecraftStatus('java', host, port, 5);
+      if (result?.online) {
+        return {
+          isOnline: true,
+          playersOnline: result.players ? `${result.players.online ?? 0}/${result.players.max ?? '?'}` : '—',
+          version: cleanMotd(result.version?.name_clean || '') || 'Unknown',
+          motd: cleanMotd(result.motd?.clean || '') || 'Minecraft server',
+          playerList: (result.players?.list || []).map(p => p.name_clean || p.name_raw).filter(Boolean),
+          retrievedAt: result.retrieved_at || Date.now()
+        };
+      }
+    } catch (_) {
+      if (attempt === 0) await new Promise(r => setTimeout(r, 800));
+    }
+  }
+  return { isOnline: false, playersOnline: '—', version: '—', motd: 'Server is offline or unreachable.', playerList: [], retrievedAt: Date.now() };
 }
 
 async function fetchFullStatus(javaHost, javaPort, bedrockHost, bedrockPort) {
-  let javaResult = null;
-  let javaOnline = false;
-
-  for (let attempt = 0; attempt < 2 && !javaOnline; attempt++) {
-    try {
-      javaResult = await mcs.status(javaHost, javaPort, { timeout: 7000, enableSRV: true });
-      javaOnline = true;
-    } catch (err) {
-      if (attempt === 0) await new Promise(r => setTimeout(r, 1200));
-    }
-  }
-
-  let bedrockResult = null;
-  let bedrockOnline = false;
-  let bedrockError = null;
-
-  for (let attempt = 0; attempt < 2 && !bedrockOnline; attempt++) {
-    try {
-      bedrockResult = await mcs.statusBedrock(bedrockHost, bedrockPort, { timeout: 6000, enableSRV: false });
-      bedrockOnline = true;
-    } catch (err) {
-      bedrockError = err && err.message ? err.message : String(err);
-      if (attempt === 0) await new Promise(r => setTimeout(r, 1200));
-    }
-  }
-
-  if (bedrockError) {
-    console.error('[Bedrock Ping Error]:', bedrockError);
-  }
-
-  const javaIp = javaPort === 25565 ? javaHost : `${javaHost}:${javaPort}`;
-  const bedrockIp = `${bedrockHost}:${bedrockPort}`;
-
-  if (!javaOnline && !bedrockOnline) {
-    return {
-      isOnline: false,
-      playersOnline: '0/0',
-      version: 'N/A',
-      motd: 'Server is Offline or Starting...',
-      playerList: [],
-      javaIp,
-      bedrockIp,
-      bedrockOnline: false
-    };
-  }
-
-  let playersOnline = '0/0';
-  let version = '1.20+';
-  let motd = 'Nethrion SMP Server';
-  let playerList = [];
-
-  if (javaOnline && javaResult) {
-    if (javaResult.players && javaResult.players.online !== undefined) {
-      playersOnline = `${javaResult.players.online}/${javaResult.players.max}`;
-      if (Array.isArray(javaResult.players.sample)) {
-        playerList = javaResult.players.sample
-          .map(p => cleanMotd(p && p.name))
-          .filter(Boolean);
-      }
-    }
-
-    const rawVersion = javaResult.version && javaResult.version.name ? javaResult.version.name : '';
-    const cleanedVersion = cleanMotd(rawVersion);
-    if (cleanedVersion && cleanedVersion.length <= 25 && !cleanedVersion.toLowerCase().includes('online')) {
-      version = cleanedVersion;
-    }
-
-    let rawMotd = '';
-    if (javaResult.motd) {
-      rawMotd = javaResult.motd.clean || javaResult.motd.raw || '';
-    }
-    const cleanedMotd = cleanMotd(rawMotd);
-    if (cleanedMotd) motd = cleanedMotd;
-  } else if (bedrockOnline && bedrockResult) {
-    if (bedrockResult.players && bedrockResult.players.online !== undefined) {
-      playersOnline = `${bedrockResult.players.online}/${bedrockResult.players.max}`;
-    }
-    const cleanedVersion = cleanMotd(bedrockResult.version && bedrockResult.version.name);
-    if (cleanedVersion) version = cleanedVersion;
-    const cleanedMotd = cleanMotd(bedrockResult.motd && (bedrockResult.motd.clean || bedrockResult.motd.raw));
-    if (cleanedMotd) motd = cleanedMotd;
-  }
-
-  // "sample" often comes back empty even with players online — try Query protocol as a backup.
-  if (javaOnline && playerList.length === 0) {
-    const onlineCount = parseInt(playersOnline.split('/')[0], 10) || 0;
-    if (onlineCount > 0) {
-      playerList = await fetchPlayerListViaQuery(javaHost, javaPort);
-    }
-  }
-
-  return { isOnline: true, playersOnline, version, motd, playerList, javaIp, bedrockIp, bedrockOnline };
+  const [j, b] = await Promise.allSettled([
+    fetchMinecraftStatus('java', javaHost, javaPort, 5),
+    fetchMinecraftStatus('bedrock', bedrockHost, bedrockPort, 5)
+  ]);
+  const java = j.status === 'fulfilled' ? j.value : null;
+  const bedrock = b.status === 'fulfilled' ? b.value : null;
+  const javaOnline = Boolean(java?.online);
+  const bedrockOnline = Boolean(bedrock?.online);
+  let playersOnline = '—';
+  if (javaOnline && java.players) playersOnline = `${java.players.online ?? 0}/${java.players.max ?? '?'}`;
+  else if (bedrockOnline && bedrock.players) playersOnline = `${bedrock.players.online ?? 0}/${bedrock.players.max ?? '?'}`;
+  const playerList = javaOnline ? (java.players?.list || []).map(p => p.name_clean || p.name_raw).filter(Boolean) : [];
+  return {
+    isOnline: javaOnline || bedrockOnline,
+    javaOnline,
+    bedrockOnline,
+    playersOnline,
+    version: cleanMotd(java?.version?.name_clean || bedrock?.version?.name || '') || '—',
+    motd: cleanMotd(java?.motd?.clean || bedrock?.motd?.clean || '') || 'NETHRION SMP',
+    playerList,
+    javaIp: javaPort === 25565 ? javaHost : `${javaHost}:${javaPort}`,
+    bedrockIp: `${bedrockHost}:${bedrockPort}`,
+    bedrockPort,
+    retrievedAt: java?.retrieved_at || bedrock?.retrieved_at || Date.now()
+  };
 }
 
-// Rich, minimal panel embed — Java IP, Bedrock IP, live player count + names.
-// Used only by the owner-only auto-updating panel (`sp smp-panel`).
-// The Bedrock address is always shown (it's a fixed, known value) — only the
-// small status dot next to it reflects whether the live ping succeeded, since
-// Bedrock pings can fail intermittently even while the server is genuinely up.
-function buildPanelEmbed(data) {
-  const { isOnline, playersOnline, version, motd, playerList, javaIp, bedrockIp, bedrockOnline } = data;
+function trimField(text, max = 1024) {
+  const value = String(text || '—').trim();
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
 
-  const embed = new EmbedBuilder().setTimestamp();
-
-  if (!isOnline) {
-    return embed
-      .setTitle('🔴 Nethrion SMP — Offline')
-      .setColor('#e74c3c')
+function buildSimpleMCEmbed(ip, data) {
+  const embed = new EmbedBuilder().setTitle('⛏️ Minecraft Server').setTimestamp();
+  if (data.isOnline) {
+    return embed.setColor('#2ecc71').setDescription(`🟢 **Online**  ·  ${data.playersOnline} players`)
       .addFields(
-        { name: '🌐 Java IP', value: `\`${javaIp}\``, inline: true },
-        { name: '📱 Bedrock IP', value: `\`${bedrockIp}\``, inline: true }
-      )
-      .setDescription('Server is currently offline or restarting.')
-      .setFooter({ text: 'Auto-updates every 30s' });
+        { name: 'Address', value: `\`${ip}\``, inline: true },
+        { name: 'Version', value: `\`${trimField(data.version, 80)}\``, inline: true },
+        { name: 'Info', value: trimField(data.motd, 400), inline: false }
+      );
   }
+  return embed.setColor('#e74c3c').setDescription(`🔴 **Offline**  ·  \`${ip}\``)
+    .setFooter({ text: 'No clear live response was received.' });
+}
 
-  embed
-    .setTitle('🟢 Nethrion SMP — Online')
-    .setColor('#2ecc71')
+function buildPanelEmbed(data) {
+  const names = (data.playerList || []).slice(0, 10);
+  return new EmbedBuilder()
+    .setTitle('⛏️ NETHRION SMP')
+    .setColor(data.isOnline ? '#2ecc71' : '#e74c3c')
+    .setDescription(`${data.isOnline ? '🟢 **Online**' : '🔴 **Offline**'}  ·  ${data.playersOnline} players`)
     .addFields(
-      { name: '🌐 Java IP', value: `\`${javaIp}\``, inline: true },
-      { name: `📱 Bedrock IP ${bedrockOnline ? '🟢' : '🟠'}`, value: `\`${bedrockIp}\``, inline: true },
-      { name: '👥 Players', value: `\`${playersOnline}\``, inline: true },
-      { name: '🧩 Version', value: `\`${version}\``, inline: true }
-    );
-
-  if (playerList.length > 0) {
-    const shown = playerList.slice(0, 6);
-    const extra = playerList.length > shown.length ? ` +${playerList.length - shown.length} more` : '';
-    embed.addFields({ name: '🎮 Online Now', value: shown.join(', ') + extra, inline: false });
-  }
-
-  embed.setDescription(`*${motd.length > 90 ? motd.slice(0, 90) + '…' : motd}*`);
-  embed.setFooter({ text: bedrockOnline ? 'Auto-updates every 30s' : 'Auto-updates every 30s • Bedrock ping unreachable right now' });
-  return embed;
+      { name: 'Java', value: `\`${data.javaIp}\`  ${data.javaOnline ? '🟢' : '🔴'}`, inline: true },
+      { name: 'Bedrock', value: `\`${data.bedrockIp}\`  ${data.bedrockOnline ? '🟢' : '🔴'}`, inline: true },
+      { name: 'Version', value: `\`${trimField(data.version, 80)}\``, inline: true },
+      { name: 'Online Now', value: names.length ? trimField(names.join(', '), 900) : 'No player names exposed by the server.', inline: false }
+    )
+    .setFooter({ text: 'Player names are only shown when exposed by the server • updates every 60s' })
+    .setTimestamp();
 }
 
 async function updateMCPanel() {
   const db = loadData();
-  if (!db.mcPanel || !db.mcPanel.channelId || !db.mcPanel.messageId) return;
-
+  if (!db.mcPanel?.channelId || !db.mcPanel?.messageId) return;
   try {
-    const channel = await client.channels.fetch(db.mcPanel.channelId).catch((e) => {
-      console.error('[MC Panel] Could not fetch channel:', e.message);
-      return null;
-    });
+    const channel = await client.channels.fetch(db.mcPanel.channelId).catch(() => null);
     if (!channel) return;
-
-    const message = await channel.messages.fetch(db.mcPanel.messageId).catch((e) => {
-      console.error('[MC Panel] Could not fetch panel message (was it deleted?):', e.message);
-      return null;
-    });
+    const message = await channel.messages.fetch(db.mcPanel.messageId).catch(() => null);
     if (!message) return;
-
-    const data = await fetchFullStatus(NETHRION_JAVA_HOST, NETHRION_JAVA_PORT, NETHRION_BEDROCK_HOST, NETHRION_BEDROCK_PORT);
-    const embed = buildPanelEmbed(data);
-
-    await message.edit({ embeds: [embed] });
+    const cfg = db.smpConfig || { ...DEFAULT_SMP };
+    const data = await fetchFullStatus(cfg.javaHost, cfg.javaPort, cfg.bedrockHost, cfg.bedrockPort);
+    await message.edit({ embeds: [buildPanelEmbed(data)] });
   } catch (err) {
     console.error('[MC Panel Error]:', err.message);
   }
@@ -344,7 +231,7 @@ async function checkYouTubeUploads() {
 
     if (videoIdMatch && videoIdMatch[1]) {
       const latestVideoId = videoIdMatch[1];
-      const videoTitle = titleMatch ? titleMatch[1] : 'New Video Uploaded!';
+      const videoTitle = titleMatch ? titleMatch[1].replace(/&amp;/g, '&').replace(/&quot;/g, '"') : 'New Video Uploaded!';
 
       if (db.ytConfig.lastVideoId !== latestVideoId) {
         db.ytConfig.lastVideoId = latestVideoId;
@@ -371,9 +258,45 @@ client.once('ready', () => {
 
   // 30s is the safe floor: fast enough to feel "live", but won't risk Discord's
   // message-edit rate limit or hammer the Minecraft server with pings.
-  setInterval(updateMCPanel, 30 * 1000);
+  setInterval(updateMCPanel, 60 * 1000);
+  setTimeout(updateMCPanel, 3000);
   setInterval(checkYouTubeUploads, 5 * 60 * 1000);
+  setInterval(() => {
+    try {
+      const data = loadData();
+      data.activity = data.activity || {};
+      for (const [day, snapshot] of liveDailyActivity.entries()) data.activity[day] = snapshot;
+      const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 14);
+      for (const day of Object.keys(data.activity)) if (new Date(day) < cutoff) delete data.activity[day];
+      saveData(data);
+    } catch (err) { console.error('[Activity Save Error]:', err.message); }
+  }, 60 * 1000);
 });
+
+function parseMinecraftLinkEvent(message) {
+  const text = message.content || '';
+  if (!/(account\s+linked|linked\s+account|successfully\s+linked|linked\s+to\s+minecraft)/i.test(text)) return null;
+  const member = [...message.mentions.members.values()][0] || null;
+  if (!member) return null;
+  const blacklist = /^(account|linked|welcome|minecraft|successfully|to|with|discord)$/i;
+  const candidates = [...text.matchAll(/\b([A-Za-z0-9_]{3,16})\b/g)].map(m => m[1]).filter(x => !/^unknown$/i.test(x) && !blacklist.test(x));
+  return candidates[0] ? { member, username: candidates[0] } : null;
+}
+async function handleMinecraftLinkEvent(message) {
+  const parsed = parseMinecraftLinkEvent(message);
+  if (!parsed) return;
+  const db = loadData();
+  db.links = db.links || {};
+  db.links[parsed.member.id] = { minecraftUsername: parsed.username, linkedAt: new Date().toISOString() };
+  saveData(db);
+  const welcomeChannel = message.guild.channels.cache.find(c => c.isTextBased() && /welcome/i.test(c.name));
+  if (welcomeChannel) {
+    await welcomeChannel.send({
+      content: `🎉 **Account Linked!** Welcome **${parsed.username}** to NETHRION SMP! Make sure to read the SMP rules first.`,
+      allowedMentions: { parse: [] }
+    }).catch(() => {});
+  }
+}
 
 client.on('guildMemberAdd', async (member) => {
   try {
@@ -681,8 +604,130 @@ function isSafeLink(text) {
   });
 }
 
+function normalizeSearchText(value) {
+  return String(value || '').toLowerCase().normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/<a?:[^:>]+:\d+>/g, ' ')
+    .replace(/<@&\d+>/g, ' ')
+    .replace(/<@!?\d+>/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ').trim();
+}
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 0; i < a.length; i++) {
+    const cur = [i + 1];
+    for (let j = 0; j < b.length; j++) cur[j + 1] = Math.min(cur[j] + 1, prev[j + 1] + 1, prev[j] + (a[i] === b[j] ? 0 : 1));
+    for (let j = 0; j < cur.length; j++) prev[j] = cur[j];
+  }
+  return prev[b.length];
+}
+function roleSimilarity(query, role) {
+  const q = normalizeSearchText(query), r = normalizeSearchText(role.name);
+  if (!q || !r) return 0;
+  if (q === r) return 1;
+  if (r.includes(q)) return 0.94;
+  if (q.includes(r)) return 0.90;
+  return Math.max(0, 1 - levenshtein(q, r) / Math.max(q.length, r.length));
+}
+function resolveRole(guild, query) {
+  const raw = String(query || '').trim();
+  const mention = raw.match(/^<@&(\d+)>$/);
+  if (mention) {
+    const role = guild.roles.cache.get(mention[1]);
+    if (role) return { role, ambiguous: [] };
+  }
+  const normalized = normalizeSearchText(raw);
+  const exact = guild.roles.cache.find(r => !r.managed && r.id !== guild.id && normalizeSearchText(r.name) === normalized);
+  if (exact) return { role: exact, ambiguous: [] };
+  const candidates = guild.roles.cache.filter(r => !r.managed && r.id !== guild.id)
+    .map(role => ({ role, score: roleSimilarity(raw, role) }))
+    .sort((a, b) => b.score - a.score);
+  if (!candidates.length || candidates[0].score < 0.65) return { role: null, ambiguous: [] };
+  const [top, second] = candidates;
+  if (top.score >= 0.88 && (!second || top.score - second.score >= 0.07)) return { role: top.role, ambiguous: [] };
+  return { role: null, ambiguous: candidates.slice(0, 5) };
+}
+function getStaffRoles(guild) {
+  return guild.roles.cache.filter(role => {
+    const n = normalizeSearchText(role.name);
+    return STAFF_ROLE_NAMES.includes(n) || role.permissions.has(PermissionFlagsBits.Administrator);
+  });
+}
+async function getOrCreateReportsChannel(guild) {
+  let channel = guild.channels.cache.find(c => c.type === ChannelType.GuildText && normalizeSearchText(c.name) === normalizeSearchText(REPORT_CHANNEL_NAME));
+  if (channel) return channel;
+  const overwrites = [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks] }
+  ];
+  for (const role of getStaffRoles(guild).values()) {
+    overwrites.push({ id: role.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks] });
+  }
+  return guild.channels.create({ name: REPORT_CHANNEL_NAME, type: ChannelType.GuildText, permissionOverwrites: overwrites, reason: 'Spark private reports channel' });
+}
+function getMentionedMembers(message) { return [...message.mentions.members.values()]; }
+function splitRoleAndMentions(text) {
+  const first = String(text || '').search(/<@!?\d+>/);
+  return { roleQuery: first === -1 ? String(text || '').trim() : String(text || '').slice(0, first).trim() };
+}
+function suspiciousUrlReason(text) {
+  const urls = String(text || '').match(/https?:\/\/[^\s<>()]+/gi) || [];
+  for (const raw of urls) {
+    try {
+      const url = new URL(raw);
+      const host = url.hostname.toLowerCase().replace(/^www\./, '');
+      const full = `${host}${url.pathname}`.toLowerCase();
+      if (host === 'discord.gg' || (host === 'discord.com' && url.pathname.toLowerCase().startsWith('/invite/'))) return 'Unauthorized Discord invite';
+      if (host.includes('xn--')) return 'Potentially deceptive domain';
+      if (url.username || url.password) return 'Deceptive URL formatting';
+      if (/\.(exe|scr|msi|bat|cmd|ps1|vbs|jar|apk)(?:$|\?)/i.test(full)) return 'Executable download link';
+    } catch (_) { return 'Malformed URL'; }
+  }
+  return null;
+}
+function isMassMentionAbuse(message) {
+  return (message.mentions.everyone && !message.member.permissions.has(PermissionFlagsBits.MentionEveryone)) || message.mentions.users.size >= 8;
+}
+function normalizeSmpInput(raw) {
+  let value = String(raw || '').trim().replace(/^https?:\/\//i, '').split('/')[0];
+  let host = value;
+  let port = 25565;
+  const idx = value.lastIndexOf(':');
+  if (idx > 0 && /^\d+$/.test(value.slice(idx + 1))) {
+    host = value.slice(0, idx);
+    port = Number(value.slice(idx + 1));
+  }
+  if (!host || /\s/.test(host) || host.length > 253) throw new Error('Invalid Minecraft host/IP.');
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid port.');
+  return { host: host.toLowerCase(), port };
+}
+function canManageRole(member, role, guild) {
+  return member.id === guild.ownerId || (member.permissions.has(PermissionFlagsBits.ManageRoles) && member.roles.highest.comparePositionTo(role) > 0);
+}
+function canBotManageRole(guild, role) {
+  const me = guild.members.me;
+  return Boolean(me && me.roles.highest.comparePositionTo(role) > 0);
+}
+async function sendTemporary(channel, content, ms = 5000) {
+  const msg = await channel.send({ content }).catch(() => null);
+  if (msg) setTimeout(() => msg.delete().catch(() => {}), ms);
+  return msg;
+}
+
+const liveChannelActivity = new Map();
+const liveMessageActivity = new Map();
+const liveDailyActivity = new Map();
+const reportCooldowns = new Map();
+
 client.on('messageCreate', async (message) => {
-  if (message.author.bot || !message.guild) return;
+  if (!message.guild) return;
+  if (message.author.bot || message.webhookId) {
+    await handleMinecraftLinkEvent(message).catch(() => {});
+    if (message.author.bot) return;
+  }
 
   let content = message.content.trim();
   let lower = content.toLowerCase();
@@ -696,73 +741,45 @@ client.on('messageCreate', async (message) => {
 
   const isAdmin = message.member?.permissions.has(PermissionFlagsBits.Administrator);
 
-  if (!isAdmin) {
-    const msgContentLower = message.content.toLowerCase();
-    const userId = message.author.id;
+  // Keep Spark deliberately conservative. Normal slang and normal links stay untouched.
+  // Command messages are handled by the command layer and are not auto-moderated as chat.
+  if (!isAdmin && !cmdString) {
     let violationReason = null;
-
-    const hasBadWord = containsBadWord(message.content);
-    if (hasBadWord) {
-      violationReason = 'Toxic / Vulgar Language';
-    }
-
-    const hasInvite = msgContentLower.includes('discord.gg/') ||
-      msgContentLower.includes('discord.com/invite/') ||
-      msgContentLower.includes('discordapp.com/invite/');
-    if (hasInvite && !violationReason) {
-      violationReason = 'Unauthorized Server Invite Link';
-    }
-
-    const hasRawLink = /https?:\/\//i.test(msgContentLower);
-    if (hasRawLink && !violationReason && !isSafeLink(message.content)) {
-      violationReason = 'Unauthorized / Unrecognized Link';
-    }
-
-    if (message.mentions.users.size >= 4 && !violationReason) {
-      violationReason = 'Mass Mention Spam';
-    }
+    if (containsBadWord(message.content)) violationReason = 'Toxic / abusive language';
+    const urlReason = suspiciousUrlReason(message.content);
+    if (urlReason && !violationReason) violationReason = urlReason;
+    if (isMassMentionAbuse(message) && !violationReason) violationReason = 'Mass mention abuse';
 
     if (violationReason) {
       await message.delete().catch(() => {});
-
-      const warningMsg = await message.channel.send(`⚠️ <@${userId}>, inappropriate content is not allowed here. Message deleted.`);
-      setTimeout(() => warningMsg.delete().catch(() => {}), 4000);
-
-      let adminLogChannel = message.guild.channels.cache.find(
-        c => c.name === 'admin-reports' && c.isTextBased()
-      );
-
-      if (!adminLogChannel) {
-        adminLogChannel = await message.guild.channels.create({
-          name: 'admin-reports',
-          type: ChannelType.GuildText,
-          permissionOverwrites: [
-            { id: message.guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] }
-          ]
-        }).catch(() => {});
-      }
-
-      if (adminLogChannel) {
-        const reportEmbed = new EmbedBuilder()
-          .setTitle('🚨 SECURITY INCIDENT REPORT')
+      await sendTemporary(message.channel, `⚠️ <@${message.author.id}>, that message was removed by Spark.`, 5000);
+      const reports = await getOrCreateReportsChannel(message.guild).catch(() => null);
+      if (reports) {
+        const embed = new EmbedBuilder()
+          .setTitle('🚨 Spark Security Report')
           .setColor('#e74c3c')
           .addFields(
-            { name: '👤 User', value: `${message.author.tag} (\`${userId}\`)`, inline: true },
-            { name: '📌 Channel', value: `<#${message.channel.id}>`, inline: true },
-            { name: '⚠️ Violation Type', value: `\`${violationReason}\``, inline: true },
-            { name: '💬 Flagged Content', value: `\`\`\`${message.content}\`\`\`` }
-          )
-          .setTimestamp();
-
-        await adminLogChannel.send({ embeds: [reportEmbed] }).catch(() => {});
+            { name: 'User', value: `${message.author.tag} (\`${message.author.id}\`)`, inline: true },
+            { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+            { name: 'Reason', value: violationReason, inline: true },
+            { name: 'Content', value: message.content ? `\`\`\`\n${message.content.slice(0, 3500)}\n\`\`\`` : '*No text content*' }
+          ).setTimestamp();
+        await reports.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
       }
       return;
     }
   }
 
   const db = loadData();
+  const activityDay = getTodayString();
+  if (!liveDailyActivity.has(activityDay)) liveDailyActivity.set(activityDay, { messages: 0, members: {} });
+  const liveDay = liveDailyActivity.get(activityDay);
+  liveDay.messages += 1;
+  liveDay.members[message.author.id] = (liveDay.members[message.author.id] || 0) + 1;
+  liveChannelActivity.set(message.channel.id, { timestamp: Date.now(), count: (liveChannelActivity.get(message.channel.id)?.count || 0) + 1, name: message.channel.name });
+  liveMessageActivity.set(message.author.id, Date.now());
   const userId = message.author.id;
-  const today = getTodayString();
+  const today = activityDay;
   const yesterday = getYesterdayString();
 
   if (!db.streaks[userId]) {
@@ -792,6 +809,125 @@ client.on('messageCreate', async (message) => {
   const cmdLower = cmdString.toLowerCase();
   const args = cmdString.split(/\s+/);
   const subCmd = args[0].toLowerCase();
+
+  if (subCmd === 'role') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ You need **Manage Roles** to use this command.');
+    const { roleQuery } = splitRoleAndMentions(cmdString.slice(4).trim());
+    const targets = getMentionedMembers(message);
+    if (!roleQuery || !targets.length) return message.reply('Usage: `sp role <role name> @user @user ...`');
+    const resolved = resolveRole(message.guild, roleQuery);
+    if (!resolved.role) {
+      const choices = resolved.ambiguous.length ? resolved.ambiguous.map(x => `• **${x.role.name}**`).join('\n') : '';
+      return message.reply(choices ? `🤔 Close matches — use a role mention or be more specific:\n${choices}` : `❌ I couldn't find a role close enough to **${roleQuery}**.`);
+    }
+    const role = resolved.role;
+    if (role.managed || role.id === message.guild.id) return message.reply('❌ That role cannot be manually assigned.');
+    if (!canManageRole(message.member, role, message.guild)) return message.reply('❌ You cannot manage that role because it is above your highest role.');
+    if (!canBotManageRole(message.guild, role)) return message.reply('❌ Spark cannot manage that role. Move Spark above it.');
+    let added = 0, already = 0, failed = 0;
+    for (const member of targets) {
+      if (member.roles.cache.has(role.id)) { already++; continue; }
+      try { await member.roles.add(role, `Bulk role assignment by ${message.author.tag}`); added++; } catch (_) { failed++; }
+    }
+    await message.delete().catch(() => {});
+    const parts = [`✅ **${role.name}** → ${added} added`];
+    if (already) parts.push(`${already} already had it`);
+    if (failed) parts.push(`${failed} failed`);
+    return sendTemporary(message.channel, parts.join(' • '), 7000);
+  }
+
+  if (subCmd === 'rolelist') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ You need **Manage Roles** to use this command.');
+    const roleQuery = cmdString.slice('rolelist'.length).trim();
+    if (!roleQuery) return message.reply('Usage: `sp rolelist <role name>`');
+    const resolved = resolveRole(message.guild, roleQuery);
+    if (!resolved.role) {
+      const choices = resolved.ambiguous.length ? resolved.ambiguous.map(x => `• **${x.role.name}**`).join('\n') : '';
+      return message.reply(choices ? `🤔 Close matches — use the exact role mention:\n${choices}` : `❌ I couldn't find that role.`);
+    }
+    await message.guild.members.fetch().catch(() => null);
+    const members = [...resolved.role.members.values()].sort((a,b) => a.displayName.localeCompare(b.displayName));
+    if (!members.length) return message.reply(`📋 **${resolved.role.name}** has no members.`);
+    const totalPages = Math.ceil(members.length / 20);
+    for (let i = 0; i < members.length; i += 20) {
+      const page = members.slice(i, i + 20);
+      const pageNo = Math.floor(i / 20) + 1;
+      const embed = new EmbedBuilder()
+        .setTitle(`📋 ${resolved.role.name}${totalPages > 1 ? ` • ${pageNo}/${totalPages}` : ''}`)
+        .setDescription(page.map((m,n) => `${i+n+1}. ${m.user.tag}`).join('\n'))
+        .setColor(resolved.role.color || '#5865F2')
+        .setFooter({ text: `${members.length} member${members.length === 1 ? '' : 's'}` });
+      await message.channel.send({ embeds: [embed] });
+    }
+    return;
+  }
+
+  if (subCmd === 'report') {
+    const target = message.mentions.members.first();
+    const reason = cmdString.replace(/^report\s+/i, '').replace(/<@!?\d+>/, '').trim();
+    if (!target || !reason) return message.reply('Usage: `sp report @user <reason>`');
+    const lastReportAt = reportCooldowns.get(message.author.id) || 0;
+    if (Date.now() - lastReportAt < 20000) return message.reply('⏳ Give the report system a few seconds before sending another report.');
+    reportCooldowns.set(message.author.id, Date.now());
+    if (target.id === message.author.id) return message.reply('❌ You cannot report yourself.');
+    if (target.user.bot) return message.reply('❌ Please report a human member.');
+    const reports = await getOrCreateReportsChannel(message.guild).catch(() => null);
+    if (!reports) return message.reply('❌ I could not access the private reports channel.');
+    db.reports = db.reports || [];
+    const report = { id: (db.reports.at(-1)?.id || db.reports.length || 0) + 1, reporterId: message.author.id, targetId: target.id, reason: reason.slice(0,1000), createdAt: new Date().toISOString() };
+    db.reports.push(report); if (db.reports.length > 500) db.reports = db.reports.slice(-500); saveData(db);
+    const embed = new EmbedBuilder().setTitle(`🚨 Report #${String(report.id).padStart(3,'0')}`).setColor('#e74c3c')
+      .addFields({ name:'Reporter', value:`<@${report.reporterId}>`, inline:true }, { name:'Reported', value:`<@${report.targetId}>`, inline:true }, { name:'Reason', value:report.reason, inline:false }).setTimestamp();
+    await reports.send({ embeds:[embed], allowedMentions:{ parse:[] } });
+    await message.delete().catch(()=>{});
+    return sendTemporary(message.channel, '✅ Report sent privately to the NETHRION staff.', 5000);
+  }
+
+  if (subCmd === 'smp-set') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ You need **Manage Server** to configure the SMP.');
+    const smpArgs = cmdString.split(/\s+/).slice(1);
+    if (!smpArgs[0]) return message.reply('Usage: `sp smp-set <java-ip[:port]> [bedrock-ip] [bedrock-port]`');
+    try {
+      const java = normalizeSmpInput(smpArgs[0]);
+      let bedrockHost = java.host, bedrockPort = DEFAULT_BEDROCK_PORT;
+      if (smpArgs[1]) bedrockHost = normalizeSmpInput(smpArgs[1]).host;
+      if (smpArgs[2]) { bedrockPort = Number(smpArgs[2]); if (!Number.isInteger(bedrockPort) || bedrockPort < 1 || bedrockPort > 65535) throw new Error('Invalid Bedrock port.'); }
+      else if (java.host === DEFAULT_SMP.javaHost) { bedrockHost = DEFAULT_SMP.bedrockHost; bedrockPort = DEFAULT_SMP.bedrockPort; }
+      db.smpConfig = { javaHost: java.host, javaPort: java.port, bedrockHost, bedrockPort };
+      saveData(db);
+      return message.reply(`✅ SMP saved.\n> Java: \`${java.host}${java.port !== 25565 ? `:${java.port}` : ''}\`\n> Bedrock: \`${bedrockHost}:${bedrockPort}\``);
+    } catch (e) { return message.reply(`❌ ${e.message}`); }
+  }
+
+  if (subCmd === 'link') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ You need **Manage Server** to configure links.');
+    const target = message.mentions.members.first();
+    const ign = cmdString.replace(/^link\s+/i,'').replace(/<@!?\d+>/,'').trim();
+    if (!target || !/^[A-Za-z0-9_]{3,16}$/.test(ign)) return message.reply('Usage: `sp link @discord-user MinecraftIGN`');
+    db.links = db.links || {}; db.links[target.id] = { minecraftUsername: ign, linkedAt: new Date().toISOString() }; saveData(db);
+    return message.reply(`✅ Linked **${target.user.tag}** → **${ign}**.`);
+  }
+
+  if (subCmd === 'health' || subCmd === 'server') {
+    if (subCmd === 'health' && message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ You need **Manage Server** to use this command.');
+    const guild = message.guild;
+    const now = Date.now();
+    const online = guild.members.cache.filter(m => m.presence?.status && m.presence.status !== 'offline').size;
+    const voiceChannels = guild.channels.cache.filter(c => c.type === ChannelType.GuildVoice);
+    const activeVoice = [...voiceChannels.values()].filter(c => c.members.size > 0).sort((a,b) => b.members.size - a.members.size);
+    const activeText = [...liveChannelActivity.values()].filter(x => now - x.timestamp <= 15*60*1000).sort((a,b) => b.timestamp - a.timestamp).slice(0,5);
+    const embed = new EmbedBuilder().setTitle('📡 NETHRION Live').setColor('#5865F2')
+      .setDescription(`**${guild.name}**  ·  ${online}/${guild.memberCount} online`)
+      .addFields(
+        { name:'💬 Text', value: activeText.length ? activeText.map(x => `#${x.name}`).join('\n') : 'Quiet right now', inline:true },
+        { name:'🎙️ Voice', value: activeVoice.length ? activeVoice.slice(0,5).map(c => `${c.name} · ${c.members.size}`).join('\n') : 'No active VC', inline:true },
+        { name:'👥 Members', value:`${guild.memberCount}`, inline:true },
+        { name:'🟢 Online', value:`${online}`, inline:true },
+        { name:'🎙️ In VC', value:`${activeVoice.reduce((n,c)=>n+c.members.size,0)}`, inline:true },
+        { name:'📅 Today', value:`${liveDailyActivity.get(today)?.messages || db.activity?.[today]?.messages || 0} messages`, inline:true }
+      ).setFooter({ text:'Live activity is based on what Spark can currently see.' }).setTimestamp();
+    return message.channel.send({ embeds:[embed] });
+  }
 
   if (cmdLower === 'lock') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
@@ -951,8 +1087,8 @@ client.on('messageCreate', async (message) => {
   }
 
   if (cmdLower === 'roles-panel') {
-    if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-      return message.reply('❌ Restricted to Admins!');
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles)) {
+      return message.reply('❌ Manage Roles permission required.');
     }
 
     const textChannels = message.guild.channels.cache.filter(
@@ -994,8 +1130,8 @@ client.on('messageCreate', async (message) => {
   }
 
   if (subCmd === 'smp-panel') {
-    if (message.author.id !== message.guild.ownerId) {
-      return message.reply('❌ This command is restricted to the server owner only!');
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      return message.reply('❌ This command requires Manage Server.');
     }
 
     try {
@@ -1030,13 +1166,14 @@ client.on('messageCreate', async (message) => {
   if (subCmd === 'smp') {
     const smpArgs = cmdString.split(/\s+/);
 
-    if (smpArgs[1] && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-      return message.reply('❌ Custom IP check is restricted to Admins! Use `sp smp` directly.');
+    if (smpArgs[1] && message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      return message.reply('❌ Custom server checks are restricted to server management staff.');
     }
 
-    let host = NETHRION_JAVA_HOST;
-    let port = NETHRION_JAVA_PORT;
-    let displayIp = NETHRION_JAVA_HOST;
+    const smpCfg = db.smpConfig || { ...DEFAULT_SMP };
+    let host = smpCfg.javaHost;
+    let port = smpCfg.javaPort;
+    let displayIp = smpCfg.javaHost;
 
     if (smpArgs[1]) {
       displayIp = smpArgs[1];
@@ -1124,16 +1261,35 @@ client.on('messageCreate', async (message) => {
       .setColor('#9b59b6')
       .setDescription('Here is the complete list of member and admin commands:')
       .addFields(
-        { 
-          name: '👤 Member Commands', 
-          value: '`sp smp` - Check current Minecraft server status.\n`sp ticket` - Open a private support ticket.\n`sp streak` - View your or a member\'s streak profile.\n`sp board` - View top 10 active streaks leaderboard.\n`sp suggest <idea>` - Send community suggestion.' 
+        {
+          name: '👤 Member Commands',
+          value: [
+            '`sp smp` - Check current Minecraft server status.',
+            '`sp ticket` - Open a private support ticket.',
+            '`sp streak` - View your or a member\'s streak profile.',
+            '`sp board` - View top 10 active streaks leaderboard.',
+            '`sp suggest <idea>` - Send community suggestion.',
+            '`sp report @user <reason>` - Send a private report.',
+            '`sp role <role> @user...` - Bulk-assign a role.',
+            '`sp rolelist <role>` - List members with a role.',
+            '`sp server` - Show a live Discord activity snapshot.'
+          ].join('\n')
         },
-        { 
-          name: '👑 Admin Commands', 
-          value: '`sp smp-panel` - (Owner only) Setup live auto-updating SMP panel with player list.\n`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.\n`sp lock` / `sp unlock` - Channel control.\n`sp slock @user` / `sp sunlock @user` - User/bot channel lock.\n`sp purge <count>` / `sp purge @user <count>` / `sp purge @user <min>min` - Max 100, needs `confirm` at the end if over 20.\n`sp roles-panel` - Post dynamic role panel.' 
+        {
+          name: '👑 Admin Commands',
+          value: [
+            '`sp smp-set <java-ip[:port]> [bedrock-ip] [bedrock-port]` - Configure the SMP source.',
+            '`sp smp-panel` - Setup the live auto-updating SMP panel.',
+            '`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.',
+            '`sp lock` / `sp unlock` - Channel control.',
+            '`sp slock @user` / `sp sunlock @user` - User/bot channel lock.',
+            '`sp purge <count>` / `sp purge @user <count>` / `sp purge @user <min>min` - Cleanup recent messages.',
+            '`sp roles-panel` - Post the notification-role selector.',
+            '`sp link @user MinecraftIGN` - Manually store a Minecraft link when DiscordSRV does not expose it.'
+          ].join('\n')
         }
       )
-      .setFooter({ text: 'Nethrion SMP Admin Control' })
+      .setFooter({ text: 'NETHRION operations' })
       .setTimestamp();
 
     return message.channel.send({ embeds: [adminHelpEmbed] });
@@ -1143,14 +1299,20 @@ client.on('messageCreate', async (message) => {
     const helpEmbed = new EmbedBuilder()
       .setTitle('🔥 Spark Bot Commands Guide')
       .setColor('#3498db')
-      .setDescription('Here are all available commands for the server:')
-      .addFields(
-        { 
-          name: '👤 Available Commands', 
-          value: '`sp smp` - Check current Minecraft server status.\n`sp ticket` - Open a private support ticket.\n`sp streak` - View your or a member\'s streak profile.\n`sp board` - View top 10 active streaks leaderboard.\n`sp suggest <idea>` - Send community suggestion.' 
-        }
-      )
-      .setFooter({ text: 'Nethrion SMP Community' })
+      .setDescription('Here are the available commands:')
+      .addFields({
+        name: 'Commands',
+        value: [
+          '`sp smp` - Check current Minecraft server status.',
+          '`sp ticket` - Open a private support ticket.',
+          '`sp streak` - View your streak profile.',
+          '`sp board` - View the streak leaderboard.',
+          '`sp suggest <idea>` - Send a community suggestion.',
+          '`sp report @user <reason>` - Send a private report.',
+          '`sp server` - Show a live Discord activity snapshot.'
+        ].join('\n')
+      })
+      .setFooter({ text: 'NETHRION community' })
       .setTimestamp();
 
     return message.channel.send({ embeds: [helpEmbed] });
@@ -1277,5 +1439,8 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     console.error('[VC Error]:', err.message);
   }
 });
+
+process.on('unhandledRejection', err => console.error('[Unhandled Rejection]', err));
+process.on('uncaughtException', err => console.error('[Uncaught Exception]', err));
 
 client.login(process.env.DISCORD_TOKEN);

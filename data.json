@@ -103,5 +103,14 @@
   },
   "voiceConfig": {
     "creatorChannelId": null
-  }
+  },
+  "smpConfig": {
+    "javaHost": "nethrionsmp.pixelforge.gg",
+    "javaPort": 25565,
+    "bedrockHost": "15.235.165.81",
+    "bedrockPort": 26091
+  },
+  "reports": [],
+  "activity": {},
+  "links": {}
 }

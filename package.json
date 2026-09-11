@@ -1,15 +1,14 @@
 {
   "name": "spark-bot",
-  "version": "1.0.0",
-  "description": "Nethrion SMP Spark Autonomous Agent Bot",
+  "version": "2.0.0",
+  "description": "NETHRION all-in-one Discord community and Minecraft operations bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
-    "discord.js": "^14.14.0",
-    "dotenv": "^16.4.5",
-    "minecraft-server-util": "^5.4.1"
+    "@google/generative-ai": "^0.24.1",
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.4.5"
   }
 }
